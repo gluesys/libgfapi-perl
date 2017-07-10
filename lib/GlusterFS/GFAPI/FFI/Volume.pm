@@ -14,9 +14,12 @@ use Moo;
 use GlusterFS::GFAPI::FFI;
 use GlusterFS::GFAPI::FFI::Util qw/libgfapi_soname/;
 use File::Spec;
+use POSIX                       qw/modf/;
 use Errno                       qw/EEXIST/;
 use List::MoreUtils             qw/natatime/;
+use Try::Catch;
 use Carp;
+use Data::Dumper;
 
 use constant
 {
@@ -575,12 +578,13 @@ sub fopen
 
     $args{mode} //= 'r';
 
-    #:TODO mode 유효성 검사 및 변환
+    # :TODO
+    # mode 유효성 검사 및 변환
     my $flags = $args{mode};
 
     my $fd;
 
-    if (O_CREAT & $flags == O_CREAT)
+    if ((O_CREAT & $flags) == O_CREAT)
     {
         $fd = glfs_creat($self->fs, $args{path}, $flags, 0666);
 
@@ -609,7 +613,32 @@ sub open
     my $self = shift;
     my %args = @_;
 
-    return 0;
+    # :TODO 2017년 05월 19일 11시 02분 12초: mode 유효성 검사 및 변환
+
+    my $fd;
+
+    if ((O_CREAT & $args{flags}) == O_CREAT)
+    {
+        $fd = glfs_creat($self->fs, $args{path}, $args{flags}, $args{mode});
+
+        if (!defined($fd))
+        {
+            confess(sprintf('glfs_creat(%s, %s, %o, 0666) failed: %s'
+                    , $self->fs, $args{path}, $flags, $!));
+        }
+    }
+    else
+    {
+        $fd = glfs_open($self->fs, $args{path}, $args{flags});
+
+        if (!defined($fd))
+        {
+            confess(sprintf('glfs_open(%s, %s, %o) failed: %s'
+                    , $self->fs, $args{path}, $flags, $!));
+        }
+    }
+
+    return $fd;
 }
 
 sub opendir
@@ -617,7 +646,17 @@ sub opendir
     my $self = shift;
     my %args = @_;
 
-    return 0;
+    $args{readdirplus} = 0;
+
+    my $fd = glfs_opendir($self->fs, $args{path});
+
+    if (!defined($fd))
+    {
+        confess(sprintf('glfs_opendir(%s, %s) failed: %s'
+                , $self->fs, $args{path}));
+    }
+
+    return GlusterFS::GFAPI::FFI::Dir->new(fd => $fd, readdirplus => $args{readdirplus});
 }
 
 sub readlink
@@ -625,7 +664,16 @@ sub readlink
     my $self = shift;
     my %args = @_;
 
-    return 0;
+    my $buf = "\0" x PATH_MAX;
+    my $ret = glfs_readlink($self->fs, $args{path}, $buf, PATH_MAX);
+
+    if ($ret < 0)
+    {
+        confess(sprintf('glfs_readlink(%s, %s, %s, %d) failed: %s'
+                , $self->fs, $args{path}, 'buf', PATH_MAX, $!));
+    }
+
+    return substr($buf, 0, $ret);
 }
 
 sub remove
@@ -633,13 +681,21 @@ sub remove
     my $self = shift;
     my %args = @_;
 
-    return 0;
+    return $self->unlink($args{path});
 }
 
 sub removexattr
 {
     my $self = shift;
     my %args = @_;
+
+    my $ret = glfs_removexattr($self->fs, $args{path}, $args{key});
+
+    if ($ret < 0)
+    {
+        confess(sprintf('glfs_removexattr(%s, %s, %s) failed: %s'
+                , $self->fs, $args{path}, $args{key}, $!));
+    }
 
     return 0;
 }
@@ -649,6 +705,14 @@ sub rename
     my $self = shift;
     my %args = @_;
 
+    my $ret = glfs_rename($self->fs, $args{src}, $args{dst});
+
+    if ($ret < 0)
+    {
+        confess(sprintf('glfs_rename(%s, %s, %s) failed: %s'
+                , $self->fs, $args{src}, $args{dst}, $!));
+    }
+
     return 0;
 }
 
@@ -656,6 +720,14 @@ sub rmdir
 {
     my $self = shift;
     my %args = @_;
+
+    my $ret = glfs_rmdir($self->fs, $args{path});
+
+    if ($ret < 0)
+    {
+        confess(sprintf('glfs_rmdir(%s, %s) failed: %s'
+                , $self->fs, $args{path}, $!));
+    }
 
     return 0;
 }
@@ -665,6 +737,62 @@ sub rmtree
     my $self = shift;
     my %args = @_;
 
+    $args{ignore_errors} = 0;
+    $args{onerror}       = undef;
+
+    if ($self->islink($args{path}))
+    {
+        confess('Cannot call rmtree on a symbolic link');
+    }
+
+    try
+    {
+        foreach my $entry ($self->scandir($args{path}))
+        {
+            my $fullname = join('/', $args{path}, $entry->name);
+
+            if ($entry->is_dir(follow_symlinks => 0))
+            {
+                $self->rmtree(
+                    path          => $fullname,
+                    ignore_errors => $args{ignore_errors},
+                    onerror       => $args{onerror});
+            }
+            else
+            {
+                try
+                {
+                    $self->unlink($fullname);
+                }
+                catch
+                {
+                    my $e = shift;
+
+                    $args{onerror}->($self, \&unlink, $fullname, $e)
+                        if (ref($args{onerror}) eq 'CODE');
+                };
+            }
+        }
+    }
+    catch
+    {
+        my $e = shift;
+
+        $args{onerror}->($self, \&scandir, $args{path}, $e)
+            if (ref($args{onerror}) eq 'CODE');
+    };
+
+    try
+    {
+        $self->rmdir($args{path});
+    }
+    catch
+    {
+        my $e = shift;
+
+        $args{onerror}->($self, \&rmdir, $args{path}, $e);
+    };
+
     return 0;
 }
 
@@ -672,6 +800,14 @@ sub setfsuid
 {
     my $self = shift;
     my %args = @_;
+
+    my $ret = glfs_setfsuid($args{uid});
+
+    if ($ret < 0)
+    {
+        confess(sprintf('glfs_setfsuid(%d) failed: %s'
+                , $args{uid}, $!));
+    }
 
     return 0;
 }
@@ -681,6 +817,14 @@ sub setfsgid
     my $self = shift;
     my %args = @_;
 
+    my $ret = glfs_setfsgid($args{gid});
+
+    if ($ret < 0)
+    {
+        confess(sprintf('glfs_setfsguid(%d) failed: %s'
+                , $args{gid}, $!));
+    }
+
     return 0;
 }
 
@@ -688,6 +832,20 @@ sub setxattr
 {
     my $self = shift;
     my %args = @_;
+
+    $args{flags} = 0;
+
+    my $ret = glfs_setxattr($self->fs, $args{path}, $args{key}
+                            , $args{value}, length($args{value})
+                            , $args{flags});
+
+    if ($ret < 0)
+    {
+        confess(sprintf('glfs_setxattr(%s, %s, %s, %s, %d, %o) failed: %s'
+                , $self->fs, $args{path}, $args{key}
+                , $args{value}, length($args{value})
+                , $args{flags}));
+    }
 
     return 0;
 }
@@ -697,6 +855,15 @@ sub stat
     my $self = shift;
     my %args = @_;
 
+    my $stat = GlusterFS::GFAPI::FFI::Stat->new();
+    my $rc   = glfs_stat($self->fs, $args{path}, $stat);
+
+    if ($rc < 0)
+    {
+        confess(sprintf('glfs_stat(%s, %s, %s) failed: %s'
+                , $self->fs, $args{path}, 'buf', $stat));
+    }
+
     return 0;
 }
 
@@ -704,6 +871,15 @@ sub statvfs
 {
     my $self = shift;
     my %args = @_;
+
+    my $stat = GlusterFS::GFAPI::FFI::Statvfs->new();
+    my $rc   = glfs_statvfs($self->fs, $args{path}, $stat);
+
+    if ($rc < 0)
+    {
+        confess(sprintf('glfs_statvfs(%s, %s, %s) failed: %s'
+                , $self->fs, $args{path}, 'buf', $stat));
+    }
 
     return 0;
 }
@@ -713,6 +889,14 @@ sub link
     my $self = shift;
     my %args = @_;
 
+    my $ret = glfs_link($self->fs, $args{source}, $args{link_name});
+
+    if ($ret < 0)
+    {
+        confess(sprintf('glfs_link(%s, %s, %s) failed: %s'
+                , $self->fs, $args{source}, $args{link_name}, $!));
+    }
+
     return 0;
 }
 
@@ -720,6 +904,14 @@ sub symlink
 {
     my $self = shift;
     my %args = @_;
+
+    my $ret = glfs_symlink($self->fs, $args{source}, $args{link_name});
+
+    if ($ret < 0)
+    {
+        confess(sprintf('glfs_symlink(%s, %s, %s) failed: %s'
+                , $self->fs, $args{source}, $args{link_name}));
+    }
 
     return 0;
 }
@@ -729,6 +921,14 @@ sub unlink
     my $self = shift;
     my %args = @_;
 
+    my $ret = glfs_unlink($self->fs, $args{path});
+
+    if ($ret < 0)
+    {
+        confess(sprintf('glfs_unlink(%s, %s) failed: %s'
+                , $self->fs, $args{path}, $!));
+    }
+
     return 0;
 }
 
@@ -736,6 +936,46 @@ sub utime
 {
     my $self = shift;
     my %args = @_;
+
+    my $now;
+
+    if (undef($args{times}))
+    {
+        $now         = time();
+        $args{times} = ($now, $now);
+    }
+    else
+    {
+        if (!(ref($args{times}) eq 'ARRAY' && scalar(@{$args{times}}) != 2))
+        {
+            confess('utime() arg 2 must be a array (atime, mtime)');
+        }
+    }
+
+    my @timespec_array = (
+        GlusterFS::GFAPI::FFI::Timespec->new(),
+        GlusterFS::GFAPI::FFI::Timespec->new(),
+    );
+
+    # Set atime
+    my ($decimal, $whole) = modf($times[0]);
+
+    $timespec_array[0]->tv_sec(int($whole));
+    $timespec_array[0]->tv_nsec(int($decimal * 1e9));
+
+    # Set mtime
+    ($decimal, $whole) = modf($times[1]);
+
+    $timespec_array[1]->tv_sec(int($whole));
+    $timespec_array[1]->tv_nsec(int($decimal * 1e9));
+
+    my $ret = glfs_utimens($self->fs, $args{path}, \@timespec_array);
+
+    if ($ret < 0)
+    {
+        confess(sprintf('glfs_utimens(%s, %s, %s) failed: %s'
+                , $self->fs, $args{path}, Dumper(\@timespec_array)));
+    }
 
     return 0;
 }
